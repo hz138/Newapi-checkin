@@ -34,6 +34,9 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
+      - name: 安装 Playwright 浏览器
+        run: playwright install chromium --with-deps
+
       - name: 缓存每日答题答案
         uses: actions/cache@v4
         with:
@@ -57,4 +60,8 @@ jobs:
           VSLLM_REQUEST_INTERVAL_SECONDS: '1'
           VSLLM_SHARE_UNLOCK: '1'
           VSLLM_CLAIM_MODEL_TASK: '0'
+          VSLLM_BROWSER_TRANSPORT: '1'
+          VSLLM_BROWSER_REQUIRED: '1'
+          VSLLM_HEADLESS: '1'
+          VSLLM_CF_WAIT_SECONDS: '120'
         run: python vsllm_flip.py
