@@ -69,4 +69,8 @@ jobs:
           VSLLM_REQUEST_INTERVAL_SECONDS: '1'
           VSLLM_SHARE_UNLOCK: '1'
           VSLLM_CLAIM_MODEL_TASK: '0'
+          VSLLM_BROWSER_TRANSPORT: '1'
+          VSLLM_BROWSER_REQUIRED: '1'
+          VSLLM_HEADLESS: '1'
+          VSLLM_CF_WAIT_SECONDS: '120'
         run: xvfb-run --auto-servernum python checkin.py
