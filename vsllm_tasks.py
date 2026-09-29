@@ -221,6 +221,8 @@ def _result_data(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 def _result_message(result: Optional[Dict[str, Any]]) -> str:
     if not result:
         return "无响应"
+    if result.get("error"):
+        return str(result.get("error"))[:180]
     payload = result.get("json")
     if isinstance(payload, dict):
         message = payload.get("message")
@@ -255,6 +257,15 @@ class GwentApi:
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
         }
+
+    def _needs_page_fallback(self, result: Dict[str, Any]) -> bool:
+        if self._looks_like_cloudflare(result):
+            return True
+        return (
+            isinstance(result, dict)
+            and not result.get("ok")
+            and _integer(result.get("status"), 0) in (0, 403, 429)
+        )
 
     def _request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
@@ -312,6 +323,423 @@ class GwentApi:
         return self._request("POST", "/api/gwent/task/claim", {"task_id": task_id})
 
 
+class BrowserGwentApi:
+    """Playwright-backed Gwent API transport.
+
+    Cloudflare can reject a plain requests client even after a successful
+    challenge elsewhere.  This transport keeps an authenticated browser
+    context alive and performs Gwent calls through that context, falling back
+    to an in-page fetch when APIRequestContext is still challenged.
+    """
+
+    def __init__(
+        self,
+        session: requests.Session,
+        base_url: str,
+        request_interval_seconds: float = 1.0,
+        sleep_func=time.sleep,
+        navigation_timeout_ms: Optional[int] = None,
+        cf_wait_seconds: Optional[float] = None,
+    ):
+        parsed = urlparse(base_url if "://" in base_url else f"https://{base_url}")
+        origin = f"{parsed.scheme or 'https'}://{parsed.netloc}".rstrip("/")
+        self.session = session
+        self.base_url = origin
+        self.target_url = f"{origin}/console/personal"
+        self.request_interval_seconds = max(0.0, float(request_interval_seconds))
+        self.sleep_func = sleep_func
+        self.navigation_timeout_ms = max(
+            10000,
+            int(
+                navigation_timeout_ms
+                if navigation_timeout_ms is not None
+                else _env_int("VSLLM_BROWSER_NAVIGATION_TIMEOUT_MS", 60000)
+            ),
+        )
+        self.cf_wait_seconds = max(
+            10.0,
+            float(
+                cf_wait_seconds
+                if cf_wait_seconds is not None
+                else _env_float("VSLLM_CF_WAIT_SECONDS", 90.0)
+            ),
+        )
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._started = False
+        self._user_id = str(session.headers.get("new-api-user") or "").strip()
+        self._authorization = str(session.headers.get("Authorization") or "").strip()
+        self._user_agent = str(session.headers.get("User-Agent") or "").strip() or (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        )
+        self._cookie_header = ""
+
+    @staticmethod
+    def _is_cf_challenge(title: str, body: str = "") -> bool:
+        title_lower = str(title or "").lower()
+        if (
+            "just a moment" in title_lower
+            or "checking your browser" in title_lower
+            or "attention required" in title_lower
+            or ("cloudflare" in title_lower and "challenge" in title_lower)
+        ):
+            return True
+        body_lower = str(body or "")[:200000].lower()
+        return (
+            "just a moment" in body_lower
+            or "checking your browser" in body_lower
+            or "cf-chl-" in body_lower
+            or "cf-chl_" in body_lower
+        )
+
+    def _add_session_cookies(self) -> None:
+        cookies = []
+        for cookie in self.session.cookies:
+            if not cookie.name or cookie.value is None:
+                continue
+            item = {
+                "name": str(cookie.name),
+                "value": str(cookie.value),
+                "path": str(cookie.path or "/"),
+            }
+            if cookie.domain:
+                item["domain"] = str(cookie.domain)
+                if cookie.secure:
+                    item["secure"] = True
+                if cookie.expires:
+                    item["expires"] = int(cookie.expires)
+            else:
+                item["url"] = self.base_url
+            cookies.append(item)
+        if cookies:
+            self._context.add_cookies(cookies)
+
+    def _observe_user_id(self, request) -> None:
+        if self._user_id:
+            return
+        try:
+            candidate = request.headers.get("new-api-user") or request.headers.get("New-Api-User")
+        except Exception:
+            return
+        candidate = str(candidate or "").strip()
+        if candidate:
+            self._user_id = candidate
+
+    def _find_user_id_from_storage(self) -> str:
+        try:
+            value = self._page.evaluate(
+                """() => {
+                    const preferred = [
+                        'new-api-user', 'new_api_user', 'newApiUser',
+                        'userId', 'user_id', 'uid', 'id'
+                    ];
+                    for (const store of [localStorage, sessionStorage]) {
+                        for (const key of preferred) {
+                            const raw = store.getItem(key);
+                            if (raw && /^[A-Za-z0-9_-]{1,80}$/.test(String(raw).trim())) {
+                                return String(raw).trim();
+                            }
+                        }
+                        for (let index = 0; index < store.length; index += 1) {
+                            const key = store.key(index);
+                            const raw = store.getItem(key) || '';
+                            const match = raw.match(
+                                /new-api-user["']?\\s*[:=]\\s*["']?([A-Za-z0-9_-]{1,80})/i
+                            );
+                            if (match) {
+                                return match[1];
+                            }
+                        }
+                    }
+                    return '';
+                }"""
+            )
+        except Exception:
+            return ""
+        return str(value or "").strip()
+
+    def _navigate(self, url: str) -> None:
+        last_error = None
+        for attempt in range(3):
+            try:
+                self._page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=self.navigation_timeout_ms,
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    self.sleep_func(3.0 * (attempt + 1))
+        raise RuntimeError(f"打开 VSLLM 页面失败：{type(last_error).__name__}") from last_error
+
+    def _wait_for_cloudflare(self) -> None:
+        deadline = time.monotonic() + self.cf_wait_seconds
+        while time.monotonic() < deadline:
+            try:
+                title = self._page.title()
+            except Exception:
+                title = ""
+            try:
+                body = self._page.content()
+            except Exception:
+                body = ""
+            if not self._is_cf_challenge(title, body):
+                return
+            try:
+                self._page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            self.sleep_func(2.0)
+        raise RuntimeError("Cloudflare 验证未通过")
+
+    def _refresh_cookie_header(self) -> None:
+        try:
+            cookies = self._context.cookies()
+        except Exception:
+            cookies = []
+        self._cookie_header = "; ".join(
+            f"{cookie.get('name')}={cookie.get('value')}"
+            for cookie in cookies
+            if cookie.get("name") and cookie.get("value") is not None
+        )
+
+    def _build_headers(self, body: Optional[Dict[str, Any]]) -> Dict[str, str]:
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+            "Origin": self.base_url,
+            "Referer": self.target_url,
+            "User-Agent": self._user_agent,
+            "new-api-user": self._user_id,
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+        if self._authorization:
+            headers["Authorization"] = self._authorization
+        if self._cookie_header:
+            headers["Cookie"] = self._cookie_header
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        return headers
+
+    @staticmethod
+    def _parse_response(status: int, ok: bool, text: str) -> Dict[str, Any]:
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        return {
+            "ok": bool(ok),
+            "status": int(status),
+            "json": payload,
+            "text": str(text or "")[:500],
+        }
+
+    @staticmethod
+    def _looks_like_cloudflare(result: Dict[str, Any]) -> bool:
+        if not isinstance(result, dict) or _integer(result.get("status"), 0) not in (403, 429):
+            return False
+        text = str(result.get("text") or "").lower()
+        return (
+            "just a moment" in text
+            or "checking your browser" in text
+            or "cf-chl-" in text
+            or "cf-chl_" in text
+        )
+
+    def _request_via_context(
+        self, method: str, path: str, body: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        headers = self._build_headers(body)
+        url = f"{self.base_url}{path}"
+        if method.upper() == "GET":
+            response = self._context.request.get(url, headers=headers, timeout=30000)
+            text = response.text()
+            return self._parse_response(response.status, response.ok, text)
+        data = json.dumps(body, ensure_ascii=False) if body is not None else None
+        response = self._context.request.post(
+            url,
+            headers=headers,
+            data=data,
+            timeout=30000,
+        )
+        return self._parse_response(response.status, response.ok, response.text())
+
+    def _request_via_page_fetch(self, method: str, path: str, body: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        fetch_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "new-api-user": self._user_id,
+        }
+        if self._authorization:
+            fetch_headers["Authorization"] = self._authorization
+        if body is not None:
+            fetch_headers["Content-Type"] = "application/json"
+        result = self._page.evaluate(
+            """async ({path, method, body, headers}) => {
+                const options = {method, headers, credentials: 'include'};
+                if (body !== null && body !== undefined) {
+                    options.body = JSON.stringify(body);
+                }
+                const response = await fetch(path, options);
+                return {
+                    status: response.status,
+                    ok: response.ok,
+                    text: await response.text()
+                };
+            }""",
+            {"path": path, "method": method, "body": body, "headers": fetch_headers},
+        )
+        if not isinstance(result, dict):
+            return {"ok": False, "status": 0, "json": None, "text": "", "path": path}
+        return self._parse_response(
+            _integer(result.get("status"), 0),
+            bool(result.get("ok")),
+            str(result.get("text") or ""),
+        )
+
+    def _recover_cloudflare(self) -> bool:
+        try:
+            self._navigate(self.target_url)
+            self._wait_for_cloudflare()
+            self._refresh_cookie_header()
+            return True
+        except Exception:
+            return False
+
+    def _ensure_started(self) -> None:
+        if self._started:
+            return
+        from playwright.sync_api import sync_playwright
+
+        self._playwright = sync_playwright().start()
+        self._browser = self._playwright.chromium.launch(
+            headless=_env_bool("VSLLM_HEADLESS", True),
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        self._context = self._browser.new_context(
+            user_agent=self._user_agent,
+            viewport={"width": 1920, "height": 1080},
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+        )
+        self._context.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
+            """
+        )
+        self._add_session_cookies()
+        self._page = self._context.new_page()
+        self._page.on("request", self._observe_user_id)
+        self._navigate(self.target_url)
+        self._wait_for_cloudflare()
+        if not self._user_id:
+            self._user_id = self._find_user_id_from_storage()
+        if not self._user_id:
+            raise RuntimeError("未识别到 new-api-user，无法调用 Gwent API")
+        self._refresh_cookie_header()
+        self._started = True
+
+    def start(self) -> None:
+        self._ensure_started()
+
+    def close(self) -> None:
+        for closer in (
+            getattr(self._context, "close", None),
+            getattr(self._browser, "close", None),
+            getattr(self._playwright, "stop", None),
+        ):
+            if closer is None:
+                continue
+            try:
+                closer()
+            except Exception:
+                pass
+        self._context = None
+        self._browser = None
+        self._playwright = None
+        self._page = None
+        self._started = False
+
+    def _needs_page_fallback(self, result: Dict[str, Any]) -> bool:
+        if self._looks_like_cloudflare(result):
+            return True
+        return (
+            isinstance(result, dict)
+            and not result.get("ok")
+            and _integer(result.get("status"), 0) in (0, 403, 429)
+        )
+
+    def _request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        try:
+            self._ensure_started()
+            self._refresh_cookie_header()
+            result = self._request_via_context(method, path, body)
+            if not self._needs_page_fallback(result):
+                result["path"] = path
+                return result
+
+            if self._recover_cloudflare():
+                self._refresh_cookie_header()
+                result = self._request_via_context(method, path, body)
+                if not self._needs_page_fallback(result):
+                    result["path"] = path
+                    return result
+
+            result = self._request_via_page_fetch(method, path, body)
+            result["path"] = path
+            return result
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": 0,
+                "json": None,
+                "text": "",
+                "error": f"{type(exc).__name__}: {exc}",
+                "path": path,
+            }
+        finally:
+            if self.request_interval_seconds > 0:
+                self.sleep_func(self.request_interval_seconds)
+
+    def status(self) -> Dict[str, Any]:
+        return self._request("GET", "/api/gwent/status")
+
+    def draw(self) -> Dict[str, Any]:
+        return self._request("POST", "/api/gwent/draw")
+
+    def share_unlock(self) -> Dict[str, Any]:
+        return self._request("POST", "/api/gwent/share_unlock")
+
+    def ad_start(self) -> Dict[str, Any]:
+        return self._request("POST", "/api/gwent/ad/start")
+
+    def ad_claim(self) -> Dict[str, Any]:
+        return self._request("POST", "/api/gwent/ad/claim")
+
+    def quiz_start(self) -> Dict[str, Any]:
+        return self._request("POST", "/api/gwent/task3/start")
+
+    def quiz_answer(self, answer_index: int) -> Dict[str, Any]:
+        return self._request("POST", "/api/gwent/task3/answer", {"answer_index": answer_index})
+
+    def claim_task(self, task_id: str) -> Dict[str, Any]:
+        return self._request("POST", "/api/gwent/task/claim", {"task_id": task_id})
+
 class VsllmAutomation:
     """Anti-waste draw/task state machine.
 
@@ -335,6 +763,7 @@ class VsllmAutomation:
         answer_cache_file: Optional[str] = None,
         sleep_func=time.sleep,
         now_func=time.time,
+        api: Optional[Any] = None,
     ):
         self.session = session
         self.base_url = base_url.rstrip("/")
@@ -369,7 +798,7 @@ class VsllmAutomation:
         )
         self.sleep_func = sleep_func
         self.now_func = now_func
-        self.api = GwentApi(self.session, self.base_url, interval, sleep_func=sleep_func)
+        self.api = api if api is not None else GwentApi(self.session, self.base_url, interval, sleep_func=sleep_func)
         self.items: List[str] = []
         self.errors: List[str] = []
         self.warnings: List[str] = []
@@ -649,8 +1078,44 @@ def run_for_account(
     session: requests.Session,
     base_url: str,
     complete_tasks: Optional[bool] = None,
+    browser_transport: Optional[bool] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Run one account through the anti-waste automation cycle."""
-    automation = VsllmAutomation(session, base_url, complete_tasks=complete_tasks, **kwargs)
-    return automation.run()
+    use_browser = (
+        _env_bool("VSLLM_BROWSER_TRANSPORT", True)
+        if browser_transport is None
+        else bool(browser_transport)
+    )
+    browser_api: Optional[BrowserGwentApi] = None
+    if use_browser:
+        request_interval = kwargs.get("request_interval_seconds")
+        try:
+            browser_api = BrowserGwentApi(
+                session,
+                base_url,
+                request_interval_seconds=(
+                    float(request_interval) if request_interval is not None else 1.0
+                ),
+                sleep_func=kwargs.get("sleep_func", time.sleep),
+            )
+            browser_api.start()
+            kwargs["api"] = browser_api
+        except Exception as exc:
+            if browser_api is not None:
+                browser_api.close()
+            browser_api = None
+            if _env_bool("VSLLM_BROWSER_REQUIRED", False):
+                raise RuntimeError(
+                    f"Playwright API 初始化失败：{type(exc).__name__}: {exc}"
+                ) from exc
+            print(f"[警告] Playwright API 初始化失败，回退普通请求：{type(exc).__name__}: {exc}")
+
+    try:
+        automation = VsllmAutomation(session, base_url, complete_tasks=complete_tasks, **kwargs)
+        result = automation.run()
+        result["transport"] = "browser" if browser_api is not None else "requests"
+        return result
+    finally:
+        if browser_api is not None:
+            browser_api.close()
