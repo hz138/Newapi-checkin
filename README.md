@@ -192,7 +192,7 @@ https://api.example1.com#MTc2NzQx...,https://api.example2.com#QVFMXzJh...,https:
 
 #### 5. 定时执行
 
-工作流默认每天 **北京时间 8:10** 自动执行签到，无需手动操作；另有 `VSLLM 自动翻卡与补任务` 工作流每 2 小时自动翻卡并补做可执行任务。
+工作流默认每天 **北京时间 8:10** 自动执行签到，无需手动操作；另有 `VSLLM 自动翻卡（每 2 小时）` 工作流每 2 小时仅自动翻卡。
 
 ---
 
@@ -479,7 +479,7 @@ schedule:
 3. 奖励到账后立即刷新状态并继续翻卡，再决定是否领取下一个任务奖励。
 4. 看广告严格等待服务端返回的时长后再领取；每日答题会缓存正确答案并记录错误选项。
 
-站点已停用旧签到接口时，脚本会跳过该错误并继续执行翻卡和今日任务。`.github/workflows/checkin.yml` 每天在签到流程后完成翻卡、看广告和每日答题；`.github/workflows/vsllm-flip.yml` 每 2 小时翻卡，并补做当前可执行且尚未完成的每日任务，仍严格遵循先翻卡后领奖。两个工作流使用同一并发组，避免同时操作账号。
+站点已停用旧签到接口时，脚本会跳过该错误并继续执行翻卡和今日任务。`.github/workflows/checkin.yml` 每天在签到流程后完成翻卡、看广告和每日答题；`.github/workflows/vsllm-flip.yml` 每 2 小时仅自动翻卡，不领取看广告/每日答题奖励；每日任务由签到工作流在耗尽翻卡次数后完成。两个工作流使用同一并发组，避免同时操作账号。
 
 **常用配置：**
 
@@ -491,7 +491,7 @@ schedule:
 | `VSLLM_TASK_QUIZ_ATTEMPTS` | `8` | 每日答题单轮最多尝试次数 |
 | `VSLLM_SHARE_UNLOCK` | `1` | 是否调用分享解锁接口 |
 | `VSLLM_CLAIM_MODEL_TASK` | `0` | 是否领取已经完成的模型使用任务；不会主动产生付费模型调用 |
-| `VSLLM_FLIP_COMPLETE_TASKS` | `1` | 每 2 小时工作流是否补做可执行的看广告/每日答题；设为 `0` 时只翻卡 |
+| `VSLLM_FLIP_COMPLETE_TASKS` | `0` | 每 2 小时工作流是否补做可执行的看广告/每日答题；默认 `0` 时只翻卡 |
 | `VSLLM_FLIP_DRAW_LIMIT` | `12` | 每 2 小时工作流的单轮翻卡上限；脚本默认值为 `4`，工作流内设置为 `12` |
 
 **输出示例：**
@@ -1300,7 +1300,7 @@ Session Cookie 相当于**临时密码**，拥有它的人可以：
 | `config_generator.html` | 网页配置生成器（可视化）|
 | `.env.example` | 通知推送环境变量配置模板 |
 | `.github/workflows/checkin.yml` | 每日签到、翻卡与今日任务工作流 |
-| `.github/workflows/vsllm-flip.yml` | 每 2 小时翻卡与补任务工作流 |
+| `.github/workflows/vsllm-flip.yml` | 每 2 小时仅翻卡工作流 |
 | `requirements.txt` | Python 依赖 |
 | `README.md` | 项目文档 |
 
