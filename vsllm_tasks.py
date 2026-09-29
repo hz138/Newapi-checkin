@@ -9,6 +9,9 @@ This module intentionally uses the authenticated ``requests.Session`` created by
 import json
 import os
 import re
+import socket
+import subprocess
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -366,8 +369,11 @@ class BrowserGwentApi:
         )
         self._playwright = None
         self._browser = None
+        self._cdp_browser = None
         self._context = None
         self._page = None
+        self._chrome_process = None
+        self._chrome_log = None
         self._started = False
         self._user_id = str(session.headers.get("new-api-user") or "").strip()
         self._authorization = str(session.headers.get("Authorization") or "").strip()
@@ -614,12 +620,114 @@ class BrowserGwentApi:
         except Exception:
             return False
 
-    def _ensure_started(self) -> None:
-        if self._started:
-            return
-        from playwright.sync_api import sync_playwright
+    @staticmethod
+    def _find_real_chrome() -> Optional[str]:
+        try:
+            from turnstile_solver import find_chrome
 
-        self._playwright = sync_playwright().start()
+            detected = find_chrome()
+            if detected:
+                return detected
+        except Exception:
+            pass
+        for candidate in (
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome",
+            "/opt/google/chrome/chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ):
+            if candidate and os.path.exists(candidate):
+                return candidate
+        return None
+
+    @staticmethod
+    def _free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    def _wait_for_cdp_port(self, port: int, timeout: float = 40.0) -> None:
+        deadline = time.monotonic() + timeout
+        last_error: Optional[Exception] = None
+        while time.monotonic() < deadline:
+            if self._chrome_process is not None and self._chrome_process.poll() is not None:
+                raise RuntimeError(
+                    f"真实 Chrome 启动失败，退出码 {self._chrome_process.returncode}"
+                )
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=2):
+                    return
+            except OSError as exc:
+                last_error = exc
+                self.sleep_func(0.5)
+        error_name = type(last_error).__name__ if last_error is not None else "TimeoutError"
+        raise RuntimeError(f"等待 Chrome CDP 端口超时：{error_name}")
+
+    def _start_real_chrome(self) -> None:
+        """Use a real Chrome process over CDP instead of bundled Chromium."""
+        chrome = self._find_real_chrome()
+        if not chrome:
+            raise RuntimeError("未找到真实 Google Chrome")
+        if self._playwright is None:
+            raise RuntimeError("Playwright 尚未初始化")
+
+        port = self._free_port()
+        user_data_dir = tempfile.mkdtemp(prefix="vsllm-chrome-")
+        self._chrome_log = tempfile.NamedTemporaryFile(
+            prefix="vsllm-chrome-",
+            suffix=".log",
+            delete=False,
+        )
+        args = [
+            chrome,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={user_data_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--remote-allow-origins=*",
+            "--window-size=1920,1080",
+            "--lang=zh-CN",
+            "about:blank",
+        ]
+        self._chrome_process = subprocess.Popen(
+            args,
+            stdout=self._chrome_log,
+            stderr=subprocess.STDOUT,
+        )
+        self._wait_for_cdp_port(port)
+        self._cdp_browser = self._playwright.chromium.connect_over_cdp(
+            f"http://127.0.0.1:{port}"
+        )
+        self._browser = self._cdp_browser
+        contexts = self._browser.contexts
+        if not contexts:
+            raise RuntimeError("真实 Chrome 未提供默认浏览器上下文")
+        self._context = contexts[0]
+        pages = self._context.pages
+        self._page = next(
+            (page for page in pages if str(page.url or "").startswith(self.base_url)),
+            pages[0] if pages else self._context.new_page(),
+        )
+        actual_user_agent = str(
+            self._page.evaluate("() => navigator.userAgent") or ""
+        ).strip()
+        if actual_user_agent:
+            self._user_agent = actual_user_agent
+        try:
+            self._page.set_extra_http_headers(
+                {"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"}
+            )
+        except Exception:
+            pass
+        print("[浏览器] 已启动真实 Chrome CDP 模式")
+
+    def _start_playwright_chromium(self) -> None:
+        if self._playwright is None:
+            raise RuntimeError("Playwright 尚未初始化")
         self._browser = self._playwright.chromium.launch(
             headless=_env_bool("VSLLM_HEADLESS", True),
             args=[
@@ -628,6 +736,7 @@ class BrowserGwentApi:
                 "--disable-dev-shm-usage",
             ],
         )
+        self._cdp_browser = None
         self._context = self._browser.new_context(
             user_agent=self._user_agent,
             viewport={"width": 1920, "height": 1080},
@@ -642,8 +751,75 @@ class BrowserGwentApi:
             Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
             """
         )
-        self._add_session_cookies()
         self._page = self._context.new_page()
+        print("[浏览器] 已启动 Playwright Chromium 回退模式")
+
+    def _terminate_chrome(self) -> None:
+        process = self._chrome_process
+        self._chrome_process = None
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=10)
+            except Exception:
+                try:
+                    process.kill()
+                    process.wait(timeout=5)
+                except Exception:
+                    pass
+        if self._chrome_log is not None:
+            try:
+                self._chrome_log.close()
+            except Exception:
+                pass
+            self._chrome_log = None
+
+    def _cleanup_browser_stack(self) -> None:
+        context = self._context
+        browser = self._browser
+        playwright = self._playwright
+        self._context = None
+        self._browser = None
+        self._cdp_browser = None
+        self._playwright = None
+        self._page = None
+        for closer in (
+            getattr(context, "close", None),
+            getattr(browser, "close", None),
+            getattr(playwright, "stop", None),
+        ):
+            if closer is None:
+                continue
+            try:
+                closer()
+            except Exception:
+                pass
+        self._terminate_chrome()
+
+    def _ensure_started(self) -> None:
+        if self._started:
+            return
+        from playwright.sync_api import sync_playwright
+
+        self._playwright = sync_playwright().start()
+        if _env_bool("VSLLM_BROWSER_REAL_CHROME", True):
+            try:
+                self._start_real_chrome()
+            except Exception as exc:
+                print(
+                    "[浏览器] 真实 Chrome 启动失败，回退 Playwright Chromium："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self._cleanup_browser_stack()
+                self._playwright = sync_playwright().start()
+
+        if self._context is None:
+            self._start_playwright_chromium()
+
+        if self._page is None:
+            raise RuntimeError("浏览器页面初始化失败")
+        self._add_session_cookies()
         self._page.on("request", self._observe_user_id)
         self._navigate(self.target_url)
         self._wait_for_cloudflare()
@@ -658,21 +834,7 @@ class BrowserGwentApi:
         self._ensure_started()
 
     def close(self) -> None:
-        for closer in (
-            getattr(self._context, "close", None),
-            getattr(self._browser, "close", None),
-            getattr(self._playwright, "stop", None),
-        ):
-            if closer is None:
-                continue
-            try:
-                closer()
-            except Exception:
-                pass
-        self._context = None
-        self._browser = None
-        self._playwright = None
-        self._page = None
+        self._cleanup_browser_stack()
         self._started = False
 
     def _needs_page_fallback(self, result: Dict[str, Any]) -> bool:
