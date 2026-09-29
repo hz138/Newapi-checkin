@@ -227,6 +227,10 @@ def _result_message(result: Optional[Dict[str, Any]]) -> str:
         if message:
             return str(message)
     status = result.get("status")
+    body = re.sub(r"<[^>]+>", " ", str(result.get("text") or ""))
+    body = re.sub(r"\s+", " ", body).strip()
+    if body and status in (401, 403, 429):
+        return f"HTTP {status}: {body[:180]}"
     return f"HTTP {status}" if status else "请求失败"
 
 
@@ -244,14 +248,26 @@ class GwentApi:
         self.base_url = base_url.rstrip("/")
         self.request_interval_seconds = max(0.0, request_interval_seconds)
         self.sleep_func = sleep_func
+        self.request_headers = {
+            "Origin": self.base_url,
+            "Referer": f"{self.base_url}/console/personal",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
 
     def _request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
         try:
             if method.upper() == "GET":
-                response = self.session.get(url, timeout=30)
+                response = self.session.get(url, timeout=30, headers=self.request_headers)
             else:
-                response = self.session.post(url, json=body, timeout=30)
+                response = self.session.post(
+                    url,
+                    json=body,
+                    timeout=30,
+                    headers=self.request_headers,
+                )
             try:
                 payload = response.json()
             except (ValueError, json.JSONDecodeError):
@@ -260,6 +276,7 @@ class GwentApi:
                 "ok": 200 <= response.status_code < 300,
                 "status": response.status_code,
                 "json": payload,
+                "text": response.text[:500],
                 "path": path,
             }
         except requests.exceptions.RequestException as exc:
