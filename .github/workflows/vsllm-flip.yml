@@ -62,6 +62,6 @@ jobs:
           VSLLM_CLAIM_MODEL_TASK: '0'
           VSLLM_BROWSER_TRANSPORT: '1'
           VSLLM_BROWSER_REQUIRED: '1'
-          VSLLM_HEADLESS: '1'
+          VSLLM_HEADLESS: '0'
           VSLLM_CF_WAIT_SECONDS: '120'
-        run: python vsllm_flip.py
+        run: xvfb-run --auto-servernum python vsllm_flip.py
