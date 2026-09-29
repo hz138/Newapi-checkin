@@ -1,47 +1,33 @@
-name: VSLLM 自动翻卡与补任务（每 2 小时）
-
+name: VSLLM 自动翻卡（每 2 小时）
 on:
   # GitHub Actions cron 使用 UTC；每 2 小时执行一次
   schedule:
     - cron: '0 */2 * * *'
   workflow_dispatch:
-
-  push:
-    branches:
-      - test/vsllm-live-actions-20260929
-
 concurrency:
   group: vsllm-automation
   cancel-in-progress: false
-
 jobs:
   flip:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
-
       - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: 准备答题缓存目录
         run: mkdir -p .cache
-
       - name: 安装依赖
         run: pip install -r requirements.txt
-
       - name: 安装 Playwright 浏览器
         run: playwright install chromium --with-deps
-
       - name: 确认 Chrome 与 xvfb
         run: |
           google-chrome --version
           which xvfb-run || (sudo apt-get update && sudo apt-get install -y xvfb)
-
       - name: 缓存每日答题答案
         uses: actions/cache@v4
         with:
@@ -49,19 +35,15 @@ jobs:
           key: vsllm-task-answers-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
             vsllm-task-answers-${{ runner.os }}-
-
-      - name: 执行 VSLLM 翻卡（并补做可执行的每日任务）
+      - name: 执行 VSLLM 每 2 小时翻卡
         env:
           CONFIG_URL: ${{ secrets.CONFIG_URL }}
           CONFIG_AUTH: ${{ secrets.CONFIG_AUTH }}
           NEWAPI_ACCOUNTS: ${{ secrets.NEWAPI_ACCOUNTS }}
-          VSLLM_FLIP_COMPLETE_TASKS: '1'
-          VSLLM_DAILY_TASKS: '1'
+          VSLLM_FLIP_COMPLETE_TASKS: '0'
+          VSLLM_DAILY_TASKS: '0'
           VSLLM_FLIP_DRAW_LIMIT: '12'
           VSLLM_DRAW_LIMIT: '12'
-          VSLLM_TASK_AD_LIMIT: '3'
-          VSLLM_TASK_QUIZ_ATTEMPTS: '8'
-          VSLLM_AD_MAX_WAIT_SECONDS: '300'
           VSLLM_REQUEST_INTERVAL_SECONDS: '1'
           VSLLM_SHARE_UNLOCK: '1'
           VSLLM_CLAIM_MODEL_TASK: '0'
