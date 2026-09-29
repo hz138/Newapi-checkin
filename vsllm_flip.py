@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """VSLLM runner for the every-two-hour GitHub Actions workflow.
 
-By default it prioritises draws and can supplement currently executable daily
-tasks using the same anti-waste ordering as the daily check-in workflow.
+This runner only uses the currently available draw chances. Daily task
+rewards are reserved for the daily check-in workflow.
 """
 
 import os
@@ -68,7 +68,7 @@ def main() -> int:
         print("[错误] 账号配置解析失败")
         return 1
 
-    complete_tasks = _env_bool("VSLLM_FLIP_COMPLETE_TASKS", True)
+    complete_tasks = _env_bool("VSLLM_FLIP_COMPLETE_TASKS", False)
     default_draw_limit = 12 if complete_tasks else 4
     draw_limit = _env_int(
         "VSLLM_FLIP_DRAW_LIMIT",
