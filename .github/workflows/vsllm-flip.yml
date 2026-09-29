@@ -37,6 +37,11 @@ jobs:
       - name: 安装 Playwright 浏览器
         run: playwright install chromium --with-deps
 
+      - name: 确认 Chrome 与 xvfb
+        run: |
+          google-chrome --version
+          which xvfb-run || (sudo apt-get update && sudo apt-get install -y xvfb)
+
       - name: 缓存每日答题答案
         uses: actions/cache@v4
         with:
@@ -61,6 +66,7 @@ jobs:
           VSLLM_SHARE_UNLOCK: '1'
           VSLLM_CLAIM_MODEL_TASK: '0'
           VSLLM_BROWSER_TRANSPORT: '1'
+          VSLLM_BROWSER_REAL_CHROME: '1'
           VSLLM_BROWSER_REQUIRED: '1'
           VSLLM_HEADLESS: '0'
           VSLLM_CF_WAIT_SECONDS: '120'
