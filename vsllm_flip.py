@@ -122,6 +122,7 @@ def main() -> int:
             print()
             continue
 
+        print(f"  传输: {result.get('transport', 'unknown')}")
         for item in result.get("items", []):
             print(f"  {item}")
         for warning in result.get("warnings", []):
