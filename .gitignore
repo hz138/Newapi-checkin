@@ -47,6 +47,9 @@ newapi_accounts.json
 newapi_accounts.txt
 lottery_bindings.json
 
+# 缓存
+.cache/
+
 # 日志
 *.log
 接口.md

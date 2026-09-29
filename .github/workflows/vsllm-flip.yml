@@ -1,18 +1,21 @@
-name: NewAPI 自动签到
+name: VSLLM 自动翻卡与补任务（每 2 小时）
 
 on:
-  # 定时执行：每天 UTC 0:10 (北京时间 8:10)
+  # GitHub Actions cron 使用 UTC；每 2 小时执行一次
   schedule:
-    - cron: '10 0 * * *'
-  # 手动触发
+    - cron: '0 */2 * * *'
   workflow_dispatch:
+
+  push:
+    branches:
+      - test/vsllm-live-actions-20260929
 
 concurrency:
   group: vsllm-automation
   cancel-in-progress: false
 
 jobs:
-  checkin:
+  flip:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -31,14 +34,6 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
-      - name: 安装 Playwright 浏览器
-        run: playwright install chromium --with-deps
-
-      - name: 确认 Chrome 与 xvfb
-        run: |
-          google-chrome --version
-          which xvfb-run || (sudo apt-get update && sudo apt-get install -y xvfb)
-
       - name: 缓存每日答题答案
         uses: actions/cache@v4
         with:
@@ -47,21 +42,14 @@ jobs:
           restore-keys: |
             vsllm-task-answers-${{ runner.os }}-
 
-      - name: 执行签到（含防浪费翻卡与今日任务）
+      - name: 执行 VSLLM 翻卡（并补做可执行的每日任务）
         env:
           CONFIG_URL: ${{ secrets.CONFIG_URL }}
           CONFIG_AUTH: ${{ secrets.CONFIG_AUTH }}
           NEWAPI_ACCOUNTS: ${{ secrets.NEWAPI_ACCOUNTS }}
-          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
-          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
-          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
-          EMAIL_SMTP_HOST: ${{ secrets.EMAIL_SMTP_HOST }}
-          EMAIL_SMTP_PORT: ${{ secrets.EMAIL_SMTP_PORT }}
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          VSLLM_FLIP_COMPLETE_TASKS: '1'
           VSLLM_DAILY_TASKS: '1'
+          VSLLM_FLIP_DRAW_LIMIT: '12'
           VSLLM_DRAW_LIMIT: '12'
           VSLLM_TASK_AD_LIMIT: '3'
           VSLLM_TASK_QUIZ_ATTEMPTS: '8'
@@ -69,4 +57,4 @@ jobs:
           VSLLM_REQUEST_INTERVAL_SECONDS: '1'
           VSLLM_SHARE_UNLOCK: '1'
           VSLLM_CLAIM_MODEL_TASK: '0'
-        run: xvfb-run --auto-servernum python checkin.py
+        run: python vsllm_flip.py

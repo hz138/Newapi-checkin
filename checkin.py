@@ -34,10 +34,14 @@ except ImportError:
 
 try:
     from lottery import run_for_account as lottery_run_for_account
-    from lottery import run_gwent_for_account
 except ImportError:
     lottery_run_for_account = None
-    run_gwent_for_account = None
+
+try:
+    from vsllm_tasks import is_vsllm_url, run_for_account as vsllm_run_for_account
+except ImportError:
+    is_vsllm_url = None
+    vsllm_run_for_account = None
 
 
 class NewAPICheckin:
@@ -737,6 +741,17 @@ def load_env_file():
                     os.environ.setdefault(key, value)
 
 
+def is_checkin_disabled_message(message: str) -> bool:
+    """判断签到接口是否已被站点停用。"""
+    text = (message or "").lower()
+    markers = (
+        "未启用", "未开启", "未开放", "已关闭", "功能关闭",
+        "不存在", "不支持", "disabled", "not enabled",
+        "not available", "not found", "404",
+    )
+    return any(marker in text for marker in markers)
+
+
 def build_advice(message: str) -> str:
     """根据失败消息生成排查建议（随通知推送）"""
     m = message.lower()
@@ -843,44 +858,91 @@ def main():
         if client.session_cookie != session_cookie:
             account['session'] = client.session_cookie
             session_updated = True
-        checkin_count = 0  # 默认值，避免历史接口失败时未定义
+        checkin_count = 0
 
-        if result['success']:
+        # VSLLM 的旧签到接口已停用，但翻卡/每日任务接口可能仍可用。
+        # 必须独立于签到结果执行，避免签到 404 时跳过今日任务。
+        vsllm_account = bool(is_vsllm_url and is_vsllm_url(url))
+        lottery_items = []
+        vsllm_result = None
+
+        if vsllm_account and vsllm_run_for_account:
+            try:
+                vsllm_result = vsllm_run_for_account(client.session, url)
+                for item in vsllm_result.get('items', []):
+                    lottery_items.append(item)
+                    print(f'  翻卡/任务: {item}')
+                for warning in vsllm_result.get('warnings', []):
+                    print(f'  [VSLLM 警告] {warning}')
+                for error in vsllm_result.get('errors', []):
+                    print(f'  [VSLLM 错误] {error}')
+                if not vsllm_result.get('items'):
+                    summary = vsllm_result.get('stop_reason') or '当前无可用翻卡次数'
+                    lottery_items.append(f'⏭️ {summary}')
+                    print(f'  翻卡/任务: ⏭️ {summary}')
+            except Exception as exc:
+                lottery_items.append('⏭️ VSLLM 自动化异常')
+                print(f'  翻卡/任务: ⏭️ VSLLM 自动化异常: {exc}')
+        elif vsllm_account:
+            lottery_items.append('⏭️ VSLLM 自动化模块不可用')
+            print('  翻卡/任务: ⏭️ VSLLM 自动化模块不可用')
+
+        checkin_disabled = (
+            vsllm_account
+            and not result.get('success')
+            and is_checkin_disabled_message(result.get('message', ''))
+        )
+        vsllm_automation_ok = bool(
+            vsllm_result
+            and (
+                vsllm_result.get('status_ok')
+                or vsllm_result.get('successful_draws', 0) > 0
+            )
+        )
+        checkin_soft_success = (
+            vsllm_account
+            and not result.get('success')
+            and checkin_disabled
+            and vsllm_automation_ok
+        )
+
+        if result['success'] or checkin_soft_success:
             success_count += 1
-            print(f'  结果: ✅ {result["message"]}')
+            if result['success']:
+                print(f'  结果: ✅ {result["message"]}')
+                if result['checkin_date']:
+                    print(f'  日期: {result["checkin_date"]}')
+                if result['quota_awarded']:
+                    quota = result['quota_awarded']
+                    if quota >= 1000000:
+                        quota_str = f'{quota / 1000000:.2f}M'
+                    elif quota >= 1000:
+                        quota_str = f'{quota / 1000:.2f}K'
+                    else:
+                        quota_str = str(quota)
+                    print(f'  奖励: +{quota_str} 额度 ({quota:,} tokens)')
+            else:
+                print(
+                    '  结果: ⏭️ VSLLM 签到接口暂不可用，'
+                    f'继续完成翻卡/每日任务（{result["message"]}）'
+                )
 
-            # 显示签到日期
-            if result['checkin_date']:
-                print(f'  日期: {result["checkin_date"]}')
-
-            # 显示获得的额度（格式化显示）
-            if result['quota_awarded']:
-                quota = result['quota_awarded']
-                # 格式化额度显示
-                if quota >= 1000000:
-                    quota_str = f'{quota / 1000000:.2f}M'
-                elif quota >= 1000:
-                    quota_str = f'{quota / 1000:.2f}K'
-                else:
-                    quota_str = str(quota)
-                print(f'  奖励: +{quota_str} 额度 ({quota:,} tokens)')
-
-            # 获取本月签到统计
-            history = client.get_checkin_history()
-            if history and history.get('stats'):
-                stats = history['stats']
-                checkin_count = stats.get('checkin_count', 0)
-                total_quota = stats.get('total_quota', 0)
-                if total_quota >= 1000000:
-                    total_str = f'{total_quota / 1000000:.2f}M'
-                elif total_quota >= 1000:
-                    total_str = f'{total_quota / 1000:.2f}K'
-                else:
-                    total_str = str(total_quota)
-                print(f'  统计: 本月已签 {checkin_count} 天，累计 {total_str} 额度')
+            # 获取本月签到统计（仅在实际签到成功时调用）
+            if result['success']:
+                history = client.get_checkin_history()
+                if history and history.get('stats'):
+                    stats = history['stats']
+                    checkin_count = stats.get('checkin_count', 0)
+                    total_quota = stats.get('total_quota', 0)
+                    if total_quota >= 1000000:
+                        total_str = f'{total_quota / 1000000:.2f}M'
+                    elif total_quota >= 1000:
+                        total_str = f'{total_quota / 1000:.2f}K'
+                    else:
+                        total_str = str(total_quota)
+                    print(f'  统计: 本月已签 {checkin_count} 天，累计 {total_str} 额度')
 
             # 抽奖（仅 lanxiu.cc 本地运行，GitHub Actions 跳过 — 绑定映射无法持久化）
-            lottery_items = []
             if 'lanxiu.cc' in url and lottery_run_for_account and not os.environ.get('GITHUB_ACTIONS'):
                 display_name = (user_info or {}).get('username') or account.get('login_username')
                 if display_name:
@@ -900,21 +962,6 @@ def main():
                             if prize.get('remaining_times', 0) <= 0:
                                 break
 
-            # 维云翻卡（本地和 GitHub Actions 都运行，最多 3 次）
-            if 'vsllm.com' in url and run_gwent_for_account:
-                for rnd in range(3):
-                    prize, err = run_gwent_for_account(client.session, url)
-                    if err:
-                        lottery_items.append(f'⏭️ {err}')
-                        print(f'  翻卡: ⏭️ {err}')
-                        break
-                    if prize:
-                        q = prize.get('quota_awarded', 0)
-                        qs = f'{q/1000000:.2f}M' if q >= 1000000 else f'{q/1000:.2f}K' if q >= 1000 else str(q)
-                        line = f'🎉 第{rnd+1}次 {prize["prize_name"]} +{qs}'
-                        lottery_items.append(line)
-                        print(f'  翻卡: {line}')
-
             # 收集结果用于钉钉通知
             account_result = {
                 'name': name,
@@ -924,6 +971,9 @@ def main():
                 'checkin_count': checkin_count,
                 'lottery': lottery_items
             }
+            if checkin_soft_success and not result.get('success'):
+                account_result['soft_success'] = True
+                account_result['checkin_disabled'] = checkin_disabled
             checkin_results.append(account_result)
         else:
             fail_count += 1
@@ -939,7 +989,8 @@ def main():
                 'success': False,
                 'message': message,
                 'session_expired': 'session' in message.lower() or '认证' in message,
-                'advice': advice
+                'advice': advice,
+                'lottery': lottery_items
             }
             checkin_results.append(account_result)
 
